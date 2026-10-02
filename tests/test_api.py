@@ -1275,6 +1275,118 @@ def test_intersect_self_overlap_attributed_to_stream_b():
     assert exc.value.sequences == [0, 1]
 
 
+def test_intersect_zero_duration_segment_after_break_is_not_overlap():
+    # Regression: stream a has seq0 (10s from 00:00:00) and, after a
+    # discontinuity, seq1 as EXTINF:0 anchored at 00:00:05. The empty range
+    # [05,05) covers no UTC instant, so it neither pairs with b nor counts as
+    # a cross-run overlap: the only common interval is seq0 x seq0.
+    snap_a = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://a.example.com/live/a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z",
+        "#EXTINF:0,", "https://a.example.com/live/a1.ts",
+    ]) + "\n"
+    snap_b = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://b.example.com/live/b0.ts",
+    ]) + "\n"
+    result = _render(
+        intersect_streams(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b])
+    )
+    assert result == [
+        (0, 0, "2024-01-01T00:00:00Z", "2024-01-01T00:00:10Z", "0", "0"),
+    ]
+
+
+def test_intersect_tiny_positive_segment_after_break_still_overlaps():
+    # The zero-duration exemption must not widen to positive lengths, however
+    # short: a 0.0001s segment of the later run inside the earlier run's
+    # range shares real UTC instants and stays an ambiguous 422.
+    snap_a = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://a.example.com/live/a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z",
+        "#EXTINF:0.0001,", "https://a.example.com/live/a1.ts",
+    ]) + "\n"
+    snap_b = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://b.example.com/live/b0.ts",
+    ]) + "\n"
+    with pytest.raises(IntersectError) as exc:
+        intersect_streams(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b])
+    assert exc.value.code == "ambiguous_program_time"
+    assert exc.value.stream == "a"
+    assert exc.value.sequences == [0, 1]
+
+
+def test_intersect_zero_duration_anchor_conflict_is_still_422():
+    # The zero-length segment's PDT anchor is not exempt from validation:
+    # the two snapshots disagree on seq1's anchor, so the conflict is still
+    # reported with its source / snapshot / sequence.
+    good = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://a.example.com/live/a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z",
+        "#EXTINF:0,", "https://a.example.com/live/a1.ts",
+    ]) + "\n"
+    bad = good.replace("2024-01-01T00:00:05Z", "2024-01-01T00:00:06Z", 1)
+    snap_b = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://b.example.com/live/b0.ts",
+    ]) + "\n"
+    with pytest.raises(IntersectError) as exc:
+        intersect_streams(URL_A, [good, bad], URL_B, [snap_b, snap_b])
+    assert exc.value.code == "program_time_conflict"
+    assert exc.value.stream == "a"
+    assert exc.value.snapshot_index == 1
+    assert exc.value.sequence == 1
+
+
+def test_intersect_zero_duration_anchor_extrapolates_within_its_run():
+    # The anchor on a zero-length segment still anchors same-run
+    # extrapolation: after the break, seq1 is EXTINF:0 at :15 and the
+    # following positive seq2 carries no anchor of its own, so its range
+    # [:15,:17) is derived from seq1's anchor. It must pair with b; ignoring
+    # the zero segment's anchor would leave the whole run unanchored.
+    snap_a = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://a.example.com/live/a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:15Z",
+        "#EXTINF:0,", "https://a.example.com/live/a1.ts",
+        "#EXTINF:2,", "https://a.example.com/live/a2.ts",
+    ]) + "\n"
+    snap_b = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:15Z",
+        "#EXTINF:4,", "https://b.example.com/live/b0.ts",
+    ]) + "\n"
+    result = _render(
+        intersect_streams(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b])
+    )
+    assert result == [
+        (2, 0, "2024-01-01T00:00:15Z", "2024-01-01T00:00:17Z", "0", "0"),
+    ]
+
+
 def test_intersect_anchor_conflict_is_422_with_old_code():
     good = m3u(1, media_sequence=0, pdt_before={0: "2024-01-01T19:04:05Z"},
                uris=["a.ts"])
@@ -1394,6 +1506,38 @@ def test_api_intersect_self_overlap_is_422():
     assert body["error"] == "ambiguous_program_time"
     assert body["stream"] == "a"
     assert body["sequences"] == [0, 1]
+
+
+def test_api_intersect_zero_duration_after_break_pairs_only_seq0():
+    # Regression: a duplicated snapshot on side a contains seq0 (10s from
+    # 00:00:00) plus an EXTINF:0 seq1 anchored at 00:00:05 after a break;
+    # side b is just seq0 covering the same 10s. The zero-length segment
+    # covers nothing and must not raise ambiguous_program_time.
+    snap_a = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://a.example.com/live/a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z",
+        "#EXTINF:0,", "https://a.example.com/live/a1.ts",
+    ]) + "\n"
+    snap_b = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://b.example.com/live/b0.ts",
+    ]) + "\n"
+    resp = intersect_post(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b])
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "intervals": [
+            {"sequence_a": 0, "sequence_b": 0,
+             "start_at": "2024-01-01T00:00:00Z",
+             "end_at": "2024-01-01T00:00:10Z",
+             "offset_a": "0", "offset_b": "0"},
+        ]
+    }
 
 
 def test_api_intersect_anchor_conflict_is_422():
@@ -1561,6 +1705,65 @@ def test_switch_plan_zero_duration_segments_provide_no_coverage():
     ]
 
 
+def test_switch_plan_zero_duration_after_break_uses_primary_seq0_only():
+    # Regression: primary seq0 covers [00:00:00, 00:00:10); after a break a
+    # zero-length seq1 anchored at 00:00:05 covers nothing. The window is the
+    # full 10s, so it must be served entirely by primary seq0 — the empty
+    # range is not cross-run overlap and never opens a backup gap.
+    snap_a = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://a.example.com/live/a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z",
+        "#EXTINF:0,", "https://a.example.com/live/a1.ts",
+    ]) + "\n"
+    snap_b = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://b.example.com/live/b0.ts",
+    ]) + "\n"
+    result = _render_plan(
+        _plan(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b],
+              start="2024-01-01T00:00:00Z", end="2024-01-01T00:00:10Z")
+    )
+    assert result == [
+        ("a", 0, "2024-01-01T00:00:00Z", "2024-01-01T00:00:10Z", "0", "10"),
+    ]
+
+
+def test_switch_plan_zero_duration_after_break_anchor_conflict_is_422():
+    # The empty segment's anchor still participates in same-run validation:
+    # conflicting cross-snapshot PDT values on seq1 keep failing with the
+    # original error code and source / snapshot / sequence.
+    good = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://a.example.com/live/a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z",
+        "#EXTINF:0,", "https://a.example.com/live/a1.ts",
+    ]) + "\n"
+    bad = good.replace("2024-01-01T00:00:05Z", "2024-01-01T00:00:06Z", 1)
+    snap_b = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://b.example.com/live/b0.ts",
+    ]) + "\n"
+    with pytest.raises(SwitchError) as exc:
+        _plan(URL_A, [good, bad], URL_B, [snap_b, snap_b],
+              start="2024-01-01T00:00:00Z", end="2024-01-01T00:00:10Z")
+    assert exc.value.code == "program_time_conflict"
+    assert exc.value.stream == "a"
+    assert exc.value.snapshot_index == 1
+    assert exc.value.sequence == 1
+
+
+
 def test_switch_plan_endpoint_touch_is_not_coverage():
     # Primary [00,02); window [02,04); backup only starts exactly at :04 —
     # half-open touching endpoints cover nothing, so [02,04) is uncovered.
@@ -1725,6 +1928,45 @@ def test_api_switch_plan_happy_path():
              "uri": "https://a.example.com/live/a2.ts",
              "start_at": "2024-01-01T19:04:04Z", "end_at": "2024-01-01T19:04:06Z",
              "offset_start": "0", "offset_end": "2"},
+        ],
+    }
+
+
+def test_api_switch_plan_zero_duration_after_break_uses_primary_only():
+    # Regression: the primary snapshots carry seq0 (10s from 00:00:00) and a
+    # post-break EXTINF:0 seq1 anchored at 00:00:05; the backup snapshots
+    # carry only seq0 over the same 10s. The empty segment neither covers
+    # time nor overlaps the earlier run, so the plan serves the whole window
+    # from primary seq0.
+    snap_a = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://a.example.com/live/a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z",
+        "#EXTINF:0,", "https://a.example.com/live/a1.ts",
+    ]) + "\n"
+    snap_b = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z",
+        "#EXTINF:10,", "https://b.example.com/live/b0.ts",
+    ]) + "\n"
+    resp = switch_post(
+        URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b],
+        start="2024-01-01T00:00:00Z", end="2024-01-01T00:00:10Z",
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "start_at": "2024-01-01T00:00:00Z",
+        "end_at": "2024-01-01T00:00:10Z",
+        "intervals": [
+            {"source": "a", "sequence": 0,
+             "uri": "https://a.example.com/live/a0.ts",
+             "start_at": "2024-01-01T00:00:00Z",
+             "end_at": "2024-01-01T00:00:10Z",
+             "offset_start": "0", "offset_end": "10"},
         ],
     }
 

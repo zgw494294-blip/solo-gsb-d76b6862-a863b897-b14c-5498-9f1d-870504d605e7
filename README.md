@@ -276,7 +276,12 @@ curl -s http://localhost:8000/v1/locate \
 5. **同一路自身重叠 → 422**：若同一路**不同断点区间**的已知 UTC 时间自身发生
    重叠，则一个共同时刻无法唯一确定该路片段，也就无法确定唯一配对，返回 422
    （`ambiguous_program_time`，带 `stream` 与候选 `sequences`）。同一连续序号
-   区间内的片段在 UTC 上首尾相接，不会触发该校验。
+   区间内的片段在 UTC 上首尾相接，不会触发该校验。**零时长片段**
+   （`EXTINF:0`，`[start, start)`）不覆盖任何时刻，因此既不产生配对，也**不
+   构成跨断点重叠**——即使它的锚点落在前一区间的覆盖范围内；但其
+   `#EXT-X-PROGRAM-DATE-TIME` 锚点仍与其他锚点一样参与本区间的精确推时与
+   一致性校验（零时长片段上的锚点冲突仍返回 `program_time_conflict`）。只有
+   两个**正长度**区间实际共享某一 UTC 时刻才报歧义。
 
 ### 响应（200）
 
@@ -313,7 +318,7 @@ curl -s http://localhost:8000/v1/locate \
 
 | `error` | 触发条件 |
 | --- | --- |
-| `ambiguous_program_time` | 同一路不同断点区间的已知 UTC 时间自身重叠，无法唯一配对；带 `stream`（`"a"`/`"b"`）与候选 `sequences` |
+| `ambiguous_program_time` | 同一路不同断点区间的**正长度**已知 UTC 区间自身重叠，无法唯一配对；零时长片段不构成重叠；带 `stream`（`"a"`/`"b"`）与候选 `sequences` |
 | `program_time_conflict` | 某路跨快照同序号锚点 UTC 不一致，或同区间多锚点与十进制时长推算不一致；带 `stream`、`snapshot_index`、`sequence` |
 | 其余单路错误 | `invalid_playlist`、`sequence_rollback`、`sequence_gap`、`overlap_conflict` 等同 `/v1/reconcile`、`/v1/locate`，一律带 `stream` 指出出错的一路 |
 
@@ -338,6 +343,38 @@ curl -s http://localhost:8000/v1/intersect \
       ]
     }
   }'
+```
+
+### 断点后的零时长片段不应误报歧义（回归示例）
+
+`a` 路两份相同快照含序号 0、`2024-01-01T00:00:00Z` 起的 10 秒片段，以及断点
+（`#EXT-X-DISCONTINUITY`）后序号 1、`00:00:05Z` 起的 **0 秒片段**；`b` 路两份
+相同快照仅含序号 0、同日 `00:00:00Z` 起的 10 秒片段。空区间 `[00:00:05,
+00:00:05)` 不覆盖任何时刻，曾被误判为与前一断点区间重叠而返回
+`ambiguous_program_time`；正确行为是 `200`，交集只配对两路序号 0：
+
+```bash
+curl -s http://localhost:8000/v1/intersect \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z\n#EXTINF:0,\nhttps://a.example.com/live/a1.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z\n#EXTINF:0,\nhttps://a.example.com/live/a1.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n"
+      ]
+    }
+  }'
+# -> {"intervals":[{"sequence_a":0,"sequence_b":0,
+#     "start_at":"2024-01-01T00:00:00Z","end_at":"2024-01-01T00:00:10Z",
+#     "offset_a":"0","offset_b":"0"}]}
 ```
 
 ## `POST /v1/switch-plan`：主备播放切换计划
@@ -380,7 +417,10 @@ curl -s http://localhost:8000/v1/intersect \
    备路片段尚未结束（同理，备路也不会在主路覆盖的时段内播放）。
 3. **半开、零时长**：区间一律按半开 `[start, end)` 处理，仅端点相接不算覆盖；
    **零时长片段（`EXTINF:0`）不提供任何覆盖**，既不会选中它，也不会在连续的
-   已锚定时间轴上制造缺口。
+   已锚定时间轴上制造缺口；断点另一侧的零时长片段同样**不构成跨断点自身重叠**
+   （即使其锚点落在前一区间内）。但它的 `#EXT-X-PROGRAM-DATE-TIME` 锚点仍参与
+   本区间的精确推时与一致性校验，只有两个**正长度**区间实际共享 UTC 时刻才报
+   `ambiguous_program_time`。
 4. **输出**：结果按 UTC 起点升序，是一段**连续且互不重叠**、恰好铺满
    `[start_at, end_at)` 的使用区间；相邻区间可能来自同一路不同片段，也可能在
    主备之间来回切换。每项给出：
@@ -435,7 +475,7 @@ curl -s http://localhost:8000/v1/intersect \
 | `error` | 触发条件 |
 | --- | --- |
 | `uncovered_time` | 两路合计仍未铺满请求时段；带 `gap_start`、`gap_end`（UTC）指出首个未覆盖区间 |
-| `ambiguous_program_time` | 某一路不同断点区间的已知 UTC 时间自身重叠；带 `stream` 与候选 `sequences` |
+| `ambiguous_program_time` | 某一路不同断点区间的**正长度**已知 UTC 区间自身重叠；零时长片段不构成重叠（但其锚点仍参与推时与冲突校验）；带 `stream` 与候选 `sequences` |
 | `program_time_conflict` | 某路跨快照同序号锚点 UTC 不一致，或同区间多锚点与十进制时长推算不一致；带 `stream`、`snapshot_index`、`sequence` |
 | 其余单路错误 | `invalid_playlist`、`sequence_rollback`、`sequence_gap`、`overlap_conflict` 等同 `/v1/intersect`，一律带 `stream` |
 | `invalid_request` | 起止时刻缺失/无时区/格式错误、`start_at ≥ end_at`、快照数量不合法、字段缺失/类型错误等 |
@@ -462,6 +502,53 @@ curl -s http://localhost:8000/v1/switch-plan \
     "end_at": "2024-01-01T19:04:06Z"
   }'
 ```
+
+### 断点后的零时长片段不应误报歧义（回归示例）
+
+沿用与 `/v1/intersect` 回归示例相同的输入：`a` 路序号 0 为 `00:00:00Z` 起的
+10 秒片段，断点后序号 1 为 `00:00:05Z` 起的 **0 秒片段**；`b` 路仅有同起点
+的 10 秒序号 0。请求切换这整个 10 秒窗口时，零时长片段不提供覆盖、也不构成
+跨断点重叠，计划应返回 `200` 且**只使用主路序号 0**（不会切到备路，也不会
+误报 `ambiguous_program_time`）：
+
+```bash
+curl -s http://localhost:8000/v1/switch-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z\n#EXTINF:0,\nhttps://a.example.com/live/a1.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z\n#EXTINF:0,\nhttps://a.example.com/live/a1.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n"
+      ]
+    },
+    "start_at": "2024-01-01T00:00:00Z",
+    "end_at": "2024-01-01T00:00:10Z"
+  }'
+```
+
+```json
+{
+  "start_at": "2024-01-01T00:00:00Z",
+  "end_at": "2024-01-01T00:00:10Z",
+  "intervals": [
+    {"source": "a", "sequence": 0, "uri": "https://a.example.com/live/a0.ts",
+     "start_at": "2024-01-01T00:00:00Z", "end_at": "2024-01-01T00:00:10Z",
+     "offset_start": "0", "offset_end": "10"}
+  ]
+}
+```
+
+若断点后片段为任意**正长度**（如 `#EXTINF:0.0001`）且落入前一区间覆盖范围，
+仍按原语义返回 `422 ambiguous_program_time`，并带 `stream` 与候选
+`sequences`（`[0, 1]`）。
 
 ### 极小小数锚点的冲突必须检出（回归示例）
 

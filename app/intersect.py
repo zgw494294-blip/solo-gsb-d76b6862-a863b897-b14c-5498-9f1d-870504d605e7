@@ -15,6 +15,14 @@ streams cut at different boundaries, each actually overlapping pair of
 segments is emitted separately (boundaries on both sides are split), and
 zero-length intersections are dropped.
 
+Zero-duration segments (``EXTINF:0``) cover no instants: they never produce
+an intersection pair, and their ranges do not count as cross-discontinuity
+overlap. Their ``#EXT-X-PROGRAM-DATE-TIME`` anchors are not ignored
+though — like every anchor they still extrapolate and validate their own
+contiguous run (a conflicting anchor on a zero-duration segment is still a
+``program_time_conflict``). A genuine positive-length overlap of two
+different runs keeps failing the request with 422.
+
 If the known-time ranges of *different discontinuity runs within one stream*
 overlap in UTC, a program instant does not identify a unique segment of that
 stream, so no unique pairing exists and the request fails with 422.
@@ -106,15 +114,27 @@ def _assert_self_disjoint(stream: str, segments: list[TimedSegment]) -> None:
     a common instant would match more than one segment of this stream and no
     unique cross-stream pairing could exist.
 
+    Zero-duration segments (``end_at == start_at``) are excluded: they cover
+    no instants in a half-open ``[start, end)`` world, so they can never make
+    a UTC instant ambiguous (their PDT anchors still extrapolate and validate
+    their own run exactly like every other anchor). Two ranges only clash when
+    both have positive length and share at least one UTC instant.
+
     Comparison is restricted to distinct runs, so the at-most-100 segments
     per snapshot window stay cheap even when a run is long.
     """
 
     involved: set[int] = set()
     for i, earlier in enumerate(segments):
+        if earlier.start_at >= earlier.end_at:
+            # A zero/negative-length segment provides no coverage and cannot
+            # share an instant with any other range.
+            continue
         for later in segments[i + 1 :]:
             if later.run_index == earlier.run_index:
                 # Timeline order; different runs are never interleaved there.
+                continue
+            if later.start_at >= later.end_at:
                 continue
             if earlier.start_at < later.end_at and later.start_at < earlier.end_at:
                 involved.add(earlier.sequence)

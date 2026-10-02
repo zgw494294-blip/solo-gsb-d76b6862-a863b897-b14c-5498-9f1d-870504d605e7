@@ -14,7 +14,9 @@ Selection inside the requested half-open window ``[start_at, end_at)``:
   usage is clipped to that gap, so the primary resumes exactly when its
   coverage returns — even in the middle of a backup segment;
 * only strictly positive half-open intersections count: zero-duration segments
-  provide no coverage and merely touching endpoints do not cover each other.
+  provide no coverage and merely touching endpoints do not cover each other; a
+  zero-duration segment after a discontinuity likewise does not overlap the
+  earlier run, but its anchor still extrapolates and validates that run.
 
 The concatenated usage intervals must cover the whole requested window. If the
 two streams together still leave an uncovered sub-range, the request fails
