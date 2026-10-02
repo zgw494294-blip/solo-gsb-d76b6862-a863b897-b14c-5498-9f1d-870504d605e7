@@ -429,6 +429,9 @@ def anchored_segments(
     unanchored runs are omitted: program time is never carried across a
     ``#EXT-X-DISCONTINUITY`` boundary. Ranges inside one run are disjoint;
     separate runs may overlap in UTC (callers detect that when relevant).
+    Zero-duration anchored segments (``EXTINF:0``) are returned with
+    ``start_at == end_at``: their anchors still drive the run and are
+    validated, but the empty range itself covers no instant.
     """
 
     intervals = _resolve_intervals(playlist_url, snapshots)

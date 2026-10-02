@@ -15,6 +15,12 @@ streams cut at different boundaries, each actually overlapping pair of
 segments is emitted separately (boundaries on both sides are split), and
 zero-length intersections are dropped.
 
+Zero-duration segments (``EXTINF:0``, so ``start_at == end_at``) cover no
+UTC instants: they never produce an intersection, and an anchor-only
+segment after a discontinuity does not count as overlapping the earlier
+run. Its anchor nevertheless stays in the merged timeline and takes part
+in the usual same-run extrapolation and anchor conflict validation.
+
 If the known-time ranges of *different discontinuity runs within one stream*
 overlap in UTC, a program instant does not identify a unique segment of that
 stream, so no unique pairing exists and the request fails with 422.
@@ -106,15 +112,26 @@ def _assert_self_disjoint(stream: str, segments: list[TimedSegment]) -> None:
     a common instant would match more than one segment of this stream and no
     unique cross-stream pairing could exist.
 
+    Zero-duration segments (``start_at == end_at``) cover no UTC instants:
+    they neither provide coverage nor overlap any range across a break, so
+    they are excluded from this pairwise check. Their anchors are *not*
+    discarded — they still participate in in-run extrapolation and in anchor
+    consistency validation performed upstream.
+
     Comparison is restricted to distinct runs, so the at-most-100 segments
     per snapshot window stay cheap even when a run is long.
     """
 
     involved: set[int] = set()
     for i, earlier in enumerate(segments):
+        # An empty range contains no instant and can never overlap anything.
+        if earlier.start_at >= earlier.end_at:
+            continue
         for later in segments[i + 1 :]:
             if later.run_index == earlier.run_index:
                 # Timeline order; different runs are never interleaved there.
+                continue
+            if later.start_at >= later.end_at:
                 continue
             if earlier.start_at < later.end_at and later.start_at < earlier.end_at:
                 involved.add(earlier.sequence)

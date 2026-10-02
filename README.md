@@ -276,7 +276,13 @@ curl -s http://localhost:8000/v1/locate \
 5. **同一路自身重叠 → 422**：若同一路**不同断点区间**的已知 UTC 时间自身发生
    重叠，则一个共同时刻无法唯一确定该路片段，也就无法确定唯一配对，返回 422
    （`ambiguous_program_time`，带 `stream` 与候选 `sequences`）。同一连续序号
-   区间内的片段在 UTC 上首尾相接，不会触发该校验。
+   区间内的片段在 UTC 上首尾相接，不会触发该校验。**零时长片段**
+   （`EXTINF:0`，`start_at == end_at`）不覆盖任何时刻：它既不产生配对，也
+   不构成跨断点重叠——即使其锚点落在另一断点区间的时间窗内（例如正片段
+   `[00:00:00, 00:00:10)` 之后，断点后一个锚定于 `00:00:05Z` 的 0 秒片段），
+   也不会误报 `ambiguous_program_time`；但其锚点仍在合并时间线上，照常参与
+   **同区间推时与锚点冲突校验**（多锚点与 `EXTINF` 推算不一致仍返回
+   `program_time_conflict`）。
 
 ### 响应（200）
 
@@ -380,7 +386,8 @@ curl -s http://localhost:8000/v1/intersect \
    备路片段尚未结束（同理，备路也不会在主路覆盖的时段内播放）。
 3. **半开、零时长**：区间一律按半开 `[start, end)` 处理，仅端点相接不算覆盖；
    **零时长片段（`EXTINF:0`）不提供任何覆盖**，既不会选中它，也不会在连续的
-   已锚定时间轴上制造缺口。
+   已锚定时间轴上制造缺口；断点后锚在别处的零时长片段也**不构成跨断点重叠**，
+   不会误报 `ambiguous_program_time`（其锚点仍参与同区间推时与锚点冲突校验）。
 4. **输出**：结果按 UTC 起点升序，是一段**连续且互不重叠**、恰好铺满
    `[start_at, end_at)` 的使用区间；相邻区间可能来自同一路不同片段，也可能在
    主备之间来回切换。每项给出：
@@ -462,6 +469,92 @@ curl -s http://localhost:8000/v1/switch-plan \
     "end_at": "2024-01-01T19:04:06Z"
   }'
 ```
+
+### 断点后的零时长片段不应误报节目时间歧义（回归示例）
+
+`a` 路两份相同快照：序号 0 为锚定于 `2024-01-01T00:00:00Z` 的 10 秒片段；
+随后一个 `#EXT-X-DISCONTINUITY`，断点后的序号 1 锚定于
+`2024-01-01T00:00:05Z`、`EXTINF:0`（零时长）。`b` 路两份相同快照只有序号
+0，同日 `00:00:00Z` 起的 10 秒片段。零时长片段不覆盖任何时刻，既不与断点
+前的 `[00:00:00, 00:00:10)` 构成跨断点重叠，也不进入配对，因此两个接口都
+应返回 `200`，而不是 `422 ambiguous_program_time`。
+
+`/v1/intersect` 期望只配对两路序号 0：
+
+```bash
+curl -s http://localhost:8000/v1/intersect \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\na0.ts\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z\n#EXTINF:0,\na1.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\na0.ts\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z\n#EXTINF:0,\na1.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nb0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nb0.ts\n"
+      ]
+    }
+  }'
+```
+
+```json
+{
+  "intervals": [
+    {"sequence_a": 0, "sequence_b": 0,
+     "start_at": "2024-01-01T00:00:00Z", "end_at": "2024-01-01T00:00:10Z",
+     "offset_a": "0", "offset_b": "0"}
+  ]
+}
+```
+
+同一输入请求该 10 秒窗口的 `/v1/switch-plan`，整个窗口只使用主路 `a` 的
+序号 0（零时长的序号 1 不被选中，也不产生缺口）：
+
+```bash
+curl -s http://localhost:8000/v1/switch-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\na0.ts\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z\n#EXTINF:0,\na1.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\na0.ts\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z\n#EXTINF:0,\na1.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nb0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nb0.ts\n"
+      ]
+    },
+    "start_at": "2024-01-01T00:00:00Z",
+    "end_at": "2024-01-01T00:00:10Z"
+  }'
+```
+
+```json
+{
+  "start_at": "2024-01-01T00:00:00Z",
+  "end_at": "2024-01-01T00:00:10Z",
+  "intervals": [
+    {"source": "a", "sequence": 0, "uri": "https://a.example.com/live/a0.ts",
+     "start_at": "2024-01-01T00:00:00Z", "end_at": "2024-01-01T00:00:10Z",
+     "offset_start": "0", "offset_end": "10"}
+  ]
+}
+```
+
+注意零时长片段的锚点并非被忽略：若把断点后的片段改成**正长度**且两段
+UTC 范围真正重叠（例如序号 1 锚定 `00:00:05Z`、`EXTINF:10`），仍按原语义
+返回 `422 ambiguous_program_time`，并在 `stream` 与候选 `sequences` 中给出
+来源与涉及序号；同一连续区间内零时长片段的多锚点与推时不一致，也仍返回
+`program_time_conflict`。
 
 ### 极小小数锚点的冲突必须检出（回归示例）
 

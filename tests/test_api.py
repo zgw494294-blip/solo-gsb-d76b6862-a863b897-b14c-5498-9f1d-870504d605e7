@@ -1170,6 +1170,30 @@ def _render(intervals):
     ]
 
 
+# Regression scenario: stream A anchors seq0 (10s) at 2024-01-01T00:00:00Z
+# and, after a discontinuity, a zero-duration seq1 anchored at 00:00:05Z.
+# Stream B anchors a single 10s seq0 at 00:00:00Z. The empty segment covers
+# nothing and must not read as a cross-break overlap of seq0's range.
+ZT = "2024-01-01T00:00:00Z"
+
+ZERO_AFTER_BREAK_A = "\n".join([
+    "#EXTM3U",
+    "#EXT-X-MEDIA-SEQUENCE:0",
+    f"#EXT-X-PROGRAM-DATE-TIME:{ZT}",
+    "#EXTINF:10,", "a0.ts",
+    "#EXT-X-DISCONTINUITY",
+    "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:05Z",
+    "#EXTINF:0,", "a1.ts",
+]) + "\n"
+
+ZERO_AFTER_BREAK_B = "\n".join([
+    "#EXTM3U",
+    "#EXT-X-MEDIA-SEQUENCE:0",
+    f"#EXT-X-PROGRAM-DATE-TIME:{ZT}",
+    "#EXTINF:10,", "b0.ts",
+]) + "\n"
+
+
 def test_intersect_splits_at_both_streams_boundaries():
     # A: 3 segments of 2s -> boundaries :00 :02 :04 :06 (sequences 0..2)
     # B: 3 segments of 3s -> boundaries :00 :03 :06 :09 (sequences 10..12)
@@ -1273,6 +1297,56 @@ def test_intersect_self_overlap_attributed_to_stream_b():
         intersect_streams(ua, sa, URL_B, [snap_b, snap_b])
     assert exc.value.stream == "b"
     assert exc.value.sequences == [0, 1]
+
+
+def test_intersect_zero_duration_after_break_is_not_self_overlap():
+    # The zero-length seq1 at :05 lives in a different run but covers no
+    # instant; it must not be reported as overlapping seq0's [00,10) range.
+    result = _render(
+        intersect_streams(
+            URL_A, [ZERO_AFTER_BREAK_A, ZERO_AFTER_BREAK_A],
+            URL_B, [ZERO_AFTER_BREAK_B, ZERO_AFTER_BREAK_B],
+        )
+    )
+    assert result == [
+        (0, 0, ZT, "2024-01-01T00:00:10Z", "0", "0"),
+    ]
+
+
+def test_intersect_zero_duration_anchor_conflict_is_still_422():
+    # Same run as seq0 (no discontinuity): the zero-length seq1 anchor must
+    # agree with extrapolation (:10); :11 is an anchor conflict even though
+    # the segment itself carries no coverage.
+    bad = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        f"#EXT-X-PROGRAM-DATE-TIME:{ZT}",
+        "#EXTINF:10,", "a0.ts",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:11Z",
+        "#EXTINF:0,", "a1.ts",
+    ]) + "\n"
+    with pytest.raises(IntersectError) as exc:
+        intersect_streams(
+            URL_A, [bad, bad],
+            URL_B, [ZERO_AFTER_BREAK_B, ZERO_AFTER_BREAK_B],
+        )
+    assert exc.value.code == "program_time_conflict"
+    assert exc.value.stream == "a"
+    assert exc.value.sequence == 1
+
+
+def test_intersect_zero_duration_pairs_with_nothing():
+    # Stream A is only the zero-length anchored segment: it yields no pair.
+    only_zero = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        f"#EXT-X-PROGRAM-DATE-TIME:{ZT}",
+        "#EXTINF:0,", "a0.ts",
+    ]) + "\n"
+    assert intersect_streams(
+        URL_A, [only_zero, only_zero],
+        URL_B, [ZERO_AFTER_BREAK_B, ZERO_AFTER_BREAK_B],
+    ) == []
 
 
 def test_intersect_anchor_conflict_is_422_with_old_code():
@@ -1394,6 +1468,21 @@ def test_api_intersect_self_overlap_is_422():
     assert body["error"] == "ambiguous_program_time"
     assert body["stream"] == "a"
     assert body["sequences"] == [0, 1]
+
+
+def test_api_intersect_zero_duration_after_break_pairs_only_seq0():
+    resp = intersect_post(
+        URL_A, [ZERO_AFTER_BREAK_A, ZERO_AFTER_BREAK_A],
+        URL_B, [ZERO_AFTER_BREAK_B, ZERO_AFTER_BREAK_B],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "intervals": [
+            {"sequence_a": 0, "sequence_b": 0,
+             "start_at": ZT, "end_at": "2024-01-01T00:00:10Z",
+             "offset_a": "0", "offset_b": "0"},
+        ]
+    }
 
 
 def test_api_intersect_anchor_conflict_is_422():
@@ -1558,6 +1647,22 @@ def test_switch_plan_zero_duration_segments_provide_no_coverage():
     assert result == [
         ("a", 0, "2024-01-01T19:04:00Z", "2024-01-01T19:04:02Z", "0", "2"),
         ("a", 2, "2024-01-01T19:04:02Z", "2024-01-01T19:04:04Z", "0", "2"),
+    ]
+
+
+def test_switch_plan_zero_duration_after_break_uses_primary_seq0_only():
+    # Regression: A's zero-length seq1 anchored inside the [00,10) window
+    # after a discontinuity must neither fail as ambiguous_program_time nor
+    # open a gap; the whole window is served by primary seq0.
+    result = _render_plan(
+        _plan(
+            URL_A, [ZERO_AFTER_BREAK_A, ZERO_AFTER_BREAK_A],
+            URL_B, [ZERO_AFTER_BREAK_B, ZERO_AFTER_BREAK_B],
+            start=ZT, end="2024-01-01T00:00:10Z",
+        )
+    )
+    assert result == [
+        ("a", 0, ZT, "2024-01-01T00:00:10Z", "0", "10"),
     ]
 
 
@@ -1741,6 +1846,25 @@ def test_api_switch_plan_normalizes_window_timezone_in_response():
     body = resp.json()
     assert body["start_at"] == "2024-01-01T19:04:01Z"
     assert body["end_at"] == "2024-01-01T19:04:03Z"
+
+
+def test_api_switch_plan_zero_duration_after_break_is_200_primary_only():
+    resp = switch_post(
+        URL_A, [ZERO_AFTER_BREAK_A, ZERO_AFTER_BREAK_A],
+        URL_B, [ZERO_AFTER_BREAK_B, ZERO_AFTER_BREAK_B],
+        start=ZT, end="2024-01-01T00:00:10Z",
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "start_at": ZT,
+        "end_at": "2024-01-01T00:00:10Z",
+        "intervals": [
+            {"source": "a", "sequence": 0,
+             "uri": "https://a.example.com/live/a0.ts",
+             "start_at": ZT, "end_at": "2024-01-01T00:00:10Z",
+             "offset_start": "0", "offset_end": "10"},
+        ],
+    }
 
 
 def test_api_switch_plan_uncovered_is_422_with_first_gap():
